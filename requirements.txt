@@ -1,0 +1,17 @@
+#
+# This source file is part of the multilingual medical QA evaluation project
+#
+# SPDX-FileCopyrightText: 2026 Stanford University and the project authors (see CONTRIBUTORS.md)
+#
+# SPDX-License-Identifier: MIT
+#
+
+ipykernel>=6.29.5
+jupyterlab>=4.3.0
+matplotlib>=3.10.1
+openpyxl>=3.1.5
+pandas>=2.2.3
+pyarrow>=18.0.0
+python-dotenv>=1.1.0
+requests>=2.32.3
+ruff>=0.11.0

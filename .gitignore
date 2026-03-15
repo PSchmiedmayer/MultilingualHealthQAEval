@@ -1,0 +1,30 @@
+#
+# This source file is part of the multilingual medical QA evaluation project
+#
+# SPDX-FileCopyrightText: 2026 Stanford University and the project authors (see CONTRIBUTORS.md)
+#
+# SPDX-License-Identifier: MIT
+#
+
+.env
+.venv/
+
+# Python cache
+*/__pycache__/
+*.pyc
+.ruff_cache/
+
+# macOS / notebook noise
+.DS_Store
+.ipynb_checkpoints/
+
+# Generated notebook variants
+notebooks/*.translation_test.ipynb
+
+# Generated study state
+inputs/
+outputs/
+review/
+
+# Local scratch / temp work
+tmp_*/
