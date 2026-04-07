@@ -319,6 +319,49 @@ def _openrouter_headers() -> dict[str, str]:
     }
 
 
+def _collect_text_fragments(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        normalized = value.strip()
+        return [normalized] if normalized else []
+    if isinstance(value, list):
+        fragments: list[str] = []
+        for item in value:
+            fragments.extend(_collect_text_fragments(item))
+        return fragments
+    if isinstance(value, dict):
+        fragments: list[str] = []
+        preferred_keys = ["text", "content", "output_text"]
+        for key in preferred_keys:
+            if key in value:
+                fragments.extend(_collect_text_fragments(value.get(key)))
+        return fragments
+    return []
+
+
+def _extract_openrouter_response_text(body: dict[str, Any]) -> str | None:
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+
+    first_choice = choices[0]
+    if not isinstance(first_choice, dict):
+        return None
+
+    message = first_choice.get("message")
+    if isinstance(message, dict):
+        message_fragments = _collect_text_fragments(message.get("content"))
+        if message_fragments:
+            return "\n".join(message_fragments).strip()
+
+    choice_fragments = _collect_text_fragments(first_choice.get("text"))
+    if choice_fragments:
+        return "\n".join(choice_fragments).strip()
+
+    return None
+
+
 def _call_openrouter(
     *,
     model: ModelConfig,
@@ -354,7 +397,25 @@ def _call_openrouter(
             )
             response.raise_for_status()
             body = response.json()
-            return body["choices"][0]["message"]["content"].strip()
+            response_text = _extract_openrouter_response_text(body)
+            if response_text:
+                return response_text
+
+            choices = body.get("choices")
+            first_choice = choices[0] if isinstance(choices, list) and choices else {}
+            last_error = RuntimeError(
+                f"OpenRouter returned no assistant text for {model.name}. "
+                f"Finish reason: {first_choice.get('finish_reason')!r}."
+            )
+            if attempt == model.max_retries:
+                break
+
+            wait_seconds = min(2 ** (attempt - 1), 8)
+            print(
+                f"OpenRouter returned an empty response for {model.name} "
+                f"(attempt {attempt}/{model.max_retries}). Retrying in {wait_seconds}s..."
+            )
+            time.sleep(wait_seconds)
         except ReadTimeout as error:
             last_error = error
             if attempt == model.max_retries:
