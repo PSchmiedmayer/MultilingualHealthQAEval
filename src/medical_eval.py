@@ -14,7 +14,7 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 import pandas as pd
 import requests
@@ -31,6 +31,32 @@ class ModelConfig:
     max_retries: int = 3
     concurrency: int = 4
     extra_body: dict[str, Any] = field(default_factory=dict)
+
+
+DEFAULT_TRANSLATION_SYSTEM_PROMPT = (
+    "Translate accurately and return only the translated question."
+)
+DEFAULT_FALLBACK_ANSWER_OUTPUT_TOKENS = 600.0
+DEFAULT_OPENROUTER_LEGACY_PRICE_OVERRIDES: dict[str, dict[str, Any]] = {
+    "anthropic/claude-3.5-sonnet": {
+        "model_name": "Anthropic: Claude 3.5 Sonnet",
+        "input_cost_per_million": 6.0,
+        "output_cost_per_million": 30.0,
+        "pricing_source": "openrouter_legacy_override",
+    },
+    "google/gemini-pro-1.5": {
+        "model_name": "Google: Gemini 1.5 Pro",
+        "input_cost_per_million": 1.25,
+        "output_cost_per_million": 5.0,
+        "pricing_source": "openrouter_legacy_override",
+    },
+    "meta-llama/llama-3.1-405b-instruct": {
+        "model_name": "Meta: Llama 3.1 405B Instruct",
+        "input_cost_per_million": 4.0,
+        "output_cost_per_million": 4.0,
+        "pricing_source": "openrouter_legacy_override",
+    },
+}
 
 
 def questions_to_dataframe(questions: Iterable[str | dict[str, Any]]) -> pd.DataFrame:
@@ -887,3 +913,453 @@ def summarize_review_answers(
 
 def model_config_records(models: Iterable[ModelConfig]) -> pd.DataFrame:
     return pd.DataFrame([asdict(model) for model in models])
+
+
+def estimate_token_count(text: str | None, *, chars_per_token: float = 4.0) -> int:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return 0
+    safe_chars_per_token = max(chars_per_token, 0.1)
+    return max(1, math.ceil(len(normalized) / safe_chars_per_token))
+
+
+def _first_available_token_average(
+    frame: pd.DataFrame | None,
+    columns: Sequence[str],
+    *,
+    chars_per_token: float,
+) -> tuple[str | None, float | None]:
+    if frame is None or frame.empty:
+        return None, None
+
+    for column in columns:
+        if column not in frame.columns:
+            continue
+        series = frame[column].fillna("").astype(str).str.strip()
+        series = series[series != ""]
+        if series.empty:
+            continue
+        token_average = series.map(
+            lambda value: estimate_token_count(value, chars_per_token=chars_per_token)
+        ).mean()
+        return column, float(token_average)
+
+    return None, None
+
+
+def fetch_openrouter_model_catalog(*, timeout_seconds: int = 30) -> pd.DataFrame:
+    headers = {"Content-Type": "application/json"}
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    response = requests.get(
+        "https://openrouter.ai/api/v1/models",
+        headers=headers,
+        timeout=timeout_seconds,
+    )
+    response.raise_for_status()
+
+    records: list[dict[str, Any]] = []
+    for item in response.json().get("data", []):
+        pricing = item.get("pricing") or {}
+        prompt_cost = float(pricing.get("prompt") or 0.0) * 1_000_000
+        completion_cost = float(pricing.get("completion") or 0.0) * 1_000_000
+        records.append(
+            {
+                "model_id": str(item.get("id", "")),
+                "model_name": str(item.get("name", item.get("id", ""))),
+                "created": int(item.get("created", 0) or 0),
+                "input_cost_per_million": prompt_cost,
+                "output_cost_per_million": completion_cost,
+                "pricing_source": "openrouter_catalog",
+            }
+        )
+
+    frame = pd.DataFrame(records)
+    if frame.empty:
+        return frame
+    return frame.sort_values(
+        ["created", "model_id"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+
+def resolve_openrouter_model_pricing(
+    model_ids: Iterable[str],
+    *,
+    catalog: pd.DataFrame | None = None,
+    price_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+    timeout_seconds: int = 30,
+) -> pd.DataFrame:
+    unique_model_ids = list(dict.fromkeys(str(model_id) for model_id in model_ids if str(model_id)))
+    if not unique_model_ids:
+        return pd.DataFrame(
+            columns=[
+                "model_id",
+                "model_name",
+                "created",
+                "input_cost_per_million",
+                "output_cost_per_million",
+                "pricing_source",
+            ]
+        )
+
+    catalog_frame = (
+        fetch_openrouter_model_catalog(timeout_seconds=timeout_seconds)
+        if catalog is None
+        else catalog
+    )
+    catalog_lookup: dict[str, dict[str, Any]] = {}
+    if not catalog_frame.empty:
+        for row in catalog_frame.to_dict(orient="records"):
+            model_id = str(row.get("model_id", ""))
+            if model_id in unique_model_ids and model_id not in catalog_lookup:
+                catalog_lookup[model_id] = row
+
+    merged_overrides: dict[str, Mapping[str, Any]] = dict(DEFAULT_OPENROUTER_LEGACY_PRICE_OVERRIDES)
+    if price_overrides:
+        merged_overrides.update(
+            {
+                str(model_id): override
+                for model_id, override in price_overrides.items()
+            }
+        )
+
+    resolved: dict[str, dict[str, Any]] = {}
+    for model_id in unique_model_ids:
+        if model_id in catalog_lookup:
+            resolved[model_id] = dict(catalog_lookup[model_id])
+
+    for model_id, override in merged_overrides.items():
+        if model_id not in unique_model_ids:
+            continue
+        resolved[model_id] = {
+            "model_id": model_id,
+            "model_name": str(override.get("model_name", model_id)),
+            "created": int(override.get("created", 0) or 0),
+            "input_cost_per_million": float(override.get("input_cost_per_million", 0.0) or 0.0),
+            "output_cost_per_million": float(override.get("output_cost_per_million", 0.0) or 0.0),
+            "pricing_source": str(override.get("pricing_source", "override")),
+        }
+
+    missing = [model_id for model_id in unique_model_ids if model_id not in resolved]
+    if missing:
+        missing_models = ", ".join(sorted(missing))
+        raise ValueError(f"Missing OpenRouter pricing for model IDs: {missing_models}")
+
+    ordered_rows = [resolved[model_id] for model_id in unique_model_ids]
+    return pd.DataFrame(ordered_rows)
+
+
+def _build_cost_assumptions(
+    *,
+    questions: pd.DataFrame,
+    translation_samples: pd.DataFrame | None,
+    answer_samples: pd.DataFrame | None,
+    translation_system_prompt: str | None,
+    answer_system_prompt: str | None,
+    chars_per_token: float,
+    fallback_answer_output_tokens: float,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    _, question_tokens = _first_available_token_average(
+        questions,
+        ["question_text"],
+        chars_per_token=chars_per_token,
+    )
+    question_tokens = float(question_tokens or 0.0)
+
+    translated_source, translated_tokens = _first_available_token_average(
+        translation_samples,
+        ["translated_question", "translation_suggestion"],
+        chars_per_token=chars_per_token,
+    )
+    if translated_tokens is None:
+        translated_tokens = question_tokens
+        translated_source = "question_text_fallback"
+
+    answer_output_source, answer_output_tokens = _first_available_token_average(
+        answer_samples,
+        ["answer_text"],
+        chars_per_token=chars_per_token,
+    )
+    if answer_output_tokens is None:
+        answer_output_tokens = float(fallback_answer_output_tokens)
+        answer_output_source = "fallback_default"
+
+    translation_system_tokens = float(
+        estimate_token_count(translation_system_prompt, chars_per_token=chars_per_token)
+    )
+    answer_system_tokens = float(
+        estimate_token_count(answer_system_prompt, chars_per_token=chars_per_token)
+    )
+
+    assumptions = {
+        "chars_per_token": float(chars_per_token),
+        "question_tokens_per_request": question_tokens,
+        "question_tokens_source": "question_text",
+        "translated_question_tokens_per_request": float(translated_tokens),
+        "translated_question_tokens_source": str(translated_source),
+        "translation_prompt_tokens_per_request": question_tokens + translation_system_tokens,
+        "translation_prompt_tokens_source": "question_text + translation_system_prompt",
+        "translation_completion_tokens_per_request": float(translated_tokens),
+        "translation_completion_tokens_source": str(translated_source),
+        "answer_prompt_tokens_per_request": float(translated_tokens) + answer_system_tokens,
+        "answer_prompt_tokens_source": "translated_question + answer_system_prompt",
+        "answer_completion_tokens_per_request": float(answer_output_tokens),
+        "answer_completion_tokens_source": str(answer_output_source),
+        "translation_system_prompt_tokens": translation_system_tokens,
+        "answer_system_prompt_tokens": answer_system_tokens,
+    }
+
+    assumption_rows = [
+        {
+            "metric": "chars_per_token",
+            "estimated_tokens": assumptions["chars_per_token"],
+            "source": "heuristic",
+        },
+        {
+            "metric": "question_tokens_per_request",
+            "estimated_tokens": assumptions["question_tokens_per_request"],
+            "source": assumptions["question_tokens_source"],
+        },
+        {
+            "metric": "translated_question_tokens_per_request",
+            "estimated_tokens": assumptions["translated_question_tokens_per_request"],
+            "source": assumptions["translated_question_tokens_source"],
+        },
+        {
+            "metric": "translation_prompt_tokens_per_request",
+            "estimated_tokens": assumptions["translation_prompt_tokens_per_request"],
+            "source": assumptions["translation_prompt_tokens_source"],
+        },
+        {
+            "metric": "translation_completion_tokens_per_request",
+            "estimated_tokens": assumptions["translation_completion_tokens_per_request"],
+            "source": assumptions["translation_completion_tokens_source"],
+        },
+        {
+            "metric": "answer_prompt_tokens_per_request",
+            "estimated_tokens": assumptions["answer_prompt_tokens_per_request"],
+            "source": assumptions["answer_prompt_tokens_source"],
+        },
+        {
+            "metric": "answer_completion_tokens_per_request",
+            "estimated_tokens": assumptions["answer_completion_tokens_per_request"],
+            "source": assumptions["answer_completion_tokens_source"],
+        },
+    ]
+    assumptions_frame = pd.DataFrame(assumption_rows)
+    assumptions_frame["estimated_tokens"] = assumptions_frame["estimated_tokens"].round(1)
+    return assumptions, assumptions_frame
+
+
+def estimate_openrouter_cost_scenarios(
+    *,
+    questions: pd.DataFrame,
+    languages: pd.DataFrame,
+    scenarios: Mapping[str, Sequence[str]],
+    repeats_per_prompt: int = 1,
+    translation_model_id: str | None = None,
+    question_count: int | None = None,
+    language_count: int | None = None,
+    translation_samples: pd.DataFrame | None = None,
+    answer_samples: pd.DataFrame | None = None,
+    translation_system_prompt: str | None = DEFAULT_TRANSLATION_SYSTEM_PROMPT,
+    answer_system_prompt: str | None = None,
+    price_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+    chars_per_token: float = 4.0,
+    fallback_answer_output_tokens: float = DEFAULT_FALLBACK_ANSWER_OUTPUT_TOKENS,
+    timeout_seconds: int = 30,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    normalized_scenarios = {
+        str(name): [str(model_id) for model_id in model_ids if str(model_id)]
+        for name, model_ids in scenarios.items()
+    }
+
+    all_model_ids: list[str] = []
+    for model_ids in normalized_scenarios.values():
+        all_model_ids.extend(model_ids)
+    if translation_model_id:
+        all_model_ids.append(str(translation_model_id))
+
+    pricing_frame = resolve_openrouter_model_pricing(
+        all_model_ids,
+        price_overrides=price_overrides,
+        timeout_seconds=timeout_seconds,
+    )
+    pricing_lookup = {
+        str(row["model_id"]): row for row in pricing_frame.to_dict(orient="records")
+    }
+
+    assumptions, assumptions_frame = _build_cost_assumptions(
+        questions=questions,
+        translation_samples=translation_samples,
+        answer_samples=answer_samples,
+        translation_system_prompt=translation_system_prompt,
+        answer_system_prompt=answer_system_prompt,
+        chars_per_token=chars_per_token,
+        fallback_answer_output_tokens=fallback_answer_output_tokens,
+    )
+
+    scenario_question_count = int(
+        question_count if question_count is not None else len(questions)
+    )
+    scenario_language_count = int(
+        language_count if language_count is not None else len(languages)
+    )
+    requests_per_model = (
+        scenario_question_count
+        * scenario_language_count
+        * max(1, repeats_per_prompt)
+    )
+    translation_request_count = (
+        scenario_question_count * scenario_language_count if translation_model_id else 0
+    )
+
+    translation_cost = 0.0
+    translation_price_source = ""
+    if translation_model_id:
+        translation_price = pricing_lookup[str(translation_model_id)]
+        translation_input_cost = (
+            translation_request_count
+            * assumptions["translation_prompt_tokens_per_request"]
+            * float(translation_price["input_cost_per_million"])
+            / 1_000_000
+        )
+        translation_output_cost = (
+            translation_request_count
+            * assumptions["translation_completion_tokens_per_request"]
+            * float(translation_price["output_cost_per_million"])
+            / 1_000_000
+        )
+        translation_cost = translation_input_cost + translation_output_cost
+        translation_price_source = str(translation_price["pricing_source"])
+
+    summary_rows: list[dict[str, Any]] = []
+    per_model_rows: list[dict[str, Any]] = []
+    for scenario_name, model_ids in normalized_scenarios.items():
+        answer_cost_total = 0.0
+        for model_id in model_ids:
+            price = pricing_lookup[model_id]
+            estimated_input_cost = (
+                requests_per_model
+                * assumptions["answer_prompt_tokens_per_request"]
+                * float(price["input_cost_per_million"])
+                / 1_000_000
+            )
+            estimated_output_cost = (
+                requests_per_model
+                * assumptions["answer_completion_tokens_per_request"]
+                * float(price["output_cost_per_million"])
+                / 1_000_000
+            )
+            estimated_total_cost = estimated_input_cost + estimated_output_cost
+            answer_cost_total += estimated_total_cost
+            per_model_rows.append(
+                {
+                    "scenario_name": scenario_name,
+                    "model_id": model_id,
+                    "model_name": price["model_name"],
+                    "pricing_source": price["pricing_source"],
+                    "request_count": requests_per_model,
+                    "input_cost_per_million": float(price["input_cost_per_million"]),
+                    "output_cost_per_million": float(price["output_cost_per_million"]),
+                    "estimated_input_cost_usd": estimated_input_cost,
+                    "estimated_output_cost_usd": estimated_output_cost,
+                    "estimated_total_cost_usd": estimated_total_cost,
+                }
+            )
+
+        summary_rows.append(
+            {
+                "scenario_name": scenario_name,
+                "question_count": scenario_question_count,
+                "language_count": scenario_language_count,
+                "model_count": len(model_ids),
+                "repeats_per_prompt": max(1, repeats_per_prompt),
+                "translation_model_id": str(translation_model_id or ""),
+                "translation_pricing_source": translation_price_source,
+                "translation_request_count": translation_request_count,
+                "answer_request_count": requests_per_model * len(model_ids),
+                "translation_estimated_cost_usd": translation_cost,
+                "answer_estimated_cost_usd": answer_cost_total,
+                "total_estimated_cost_usd": translation_cost + answer_cost_total,
+            }
+        )
+
+    summary_frame = pd.DataFrame(summary_rows)
+    per_model_frame = pd.DataFrame(per_model_rows)
+
+    for frame in [summary_frame, per_model_frame]:
+        for column in frame.columns:
+            if column.endswith("_usd") or column.endswith("_per_million"):
+                frame[column] = frame[column].round(4)
+
+    return assumptions_frame, summary_frame, per_model_frame
+
+
+def build_budget_recommendations(
+    cost_summary: pd.DataFrame,
+    *,
+    extra_answer_iterations: Sequence[int] = (0, 1, 2, 3),
+    round_up_to_usd: float = 5.0,
+    recommended_extra_iterations: int = 2,
+) -> pd.DataFrame:
+    if cost_summary.empty:
+        return pd.DataFrame(
+            columns=[
+                "scenario_name",
+                "budget_tier",
+                "extra_answer_iterations",
+                "target_repeats_per_prompt",
+                "estimated_total_cost_usd",
+                "communicated_budget_usd",
+                "recommended_to_communicate",
+            ]
+        )
+
+    safe_round_increment = max(float(round_up_to_usd), 0.01)
+    rows: list[dict[str, Any]] = []
+    for row in cost_summary.to_dict(orient="records"):
+        base_repeats = max(1, int(row.get("repeats_per_prompt", 1) or 1))
+        translation_cost = float(row.get("translation_estimated_cost_usd", 0.0) or 0.0)
+        answer_cost = float(row.get("answer_estimated_cost_usd", 0.0) or 0.0)
+
+        for extra_iterations in extra_answer_iterations:
+            extra_iteration_count = max(0, int(extra_iterations))
+            target_repeats = base_repeats + extra_iteration_count
+            scaled_answer_cost = answer_cost * (target_repeats / base_repeats)
+            estimated_total_cost = translation_cost + scaled_answer_cost
+            communicated_budget = (
+                math.ceil(estimated_total_cost / safe_round_increment)
+                * safe_round_increment
+            )
+
+            if extra_iteration_count == 0:
+                budget_tier = "Base plan"
+            elif extra_iteration_count == 1:
+                budget_tier = "+1 extra iteration"
+            elif extra_iteration_count == recommended_extra_iterations:
+                budget_tier = "Safe budget"
+            else:
+                budget_tier = f"Conservative (+{extra_iteration_count} extra iterations)"
+
+            rows.append(
+                {
+                    "scenario_name": str(row.get("scenario_name", "")),
+                    "budget_tier": budget_tier,
+                    "extra_answer_iterations": extra_iteration_count,
+                    "target_repeats_per_prompt": target_repeats,
+                    "estimated_total_cost_usd": estimated_total_cost,
+                    "communicated_budget_usd": communicated_budget,
+                    "recommended_to_communicate": (
+                        extra_iteration_count == recommended_extra_iterations
+                    ),
+                }
+            )
+
+    frame = pd.DataFrame(rows)
+    frame["estimated_total_cost_usd"] = frame["estimated_total_cost_usd"].round(4)
+    frame["communicated_budget_usd"] = frame["communicated_budget_usd"].round(2)
+    return frame
